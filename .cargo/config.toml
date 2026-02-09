@@ -1,0 +1,11 @@
+[target.x86_64-unknown-linux-musl]
+# macOS 上需要安装 musl-cross: brew install FiloSottile/musl-cross/musl-cross
+linker = "x86_64-linux-musl-gcc"
+
+[target.aarch64-unknown-linux-musl]
+# macOS 上需要安装 musl-cross: brew install FiloSottile/musl-cross/musl-cross
+linker = "aarch64-linux-musl-gcc"
+
+[build]
+# 可选: 使用 rust-lld 作为链接器以加快编译速度
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
