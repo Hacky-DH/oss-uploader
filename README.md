@@ -135,3 +135,6 @@ Linux 版本使用 musl 静态链接，生成完全独立的二进制文件：
 ## 许可证
 
 MIT License
+
+## 备注
+整个项目是按照我之前写的python版本（boto3库）使用[opencode](https://github.com/anomalyco/opencode) AI重写的，包括主程序，测试，build脚本，github workflow等等。
