@@ -57,6 +57,7 @@ jobs:
         run: cargo install cross
 
       - name: Build release binary
+        shell: bash
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
             cross build --release --target ${{ matrix.target }}
