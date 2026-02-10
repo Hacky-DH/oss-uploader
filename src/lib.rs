@@ -301,8 +301,18 @@ impl OssClient {
     /// 生成简单的公开访问 URL（不带签名）
     /// 适用于公开可读的 bucket
     fn generate_url(&self, key: &str) -> String {
-        let encoded_key = urlencoding::encode(key);
-        format!("{}/{}", self.config.endpoint.trim_end_matches('/'), encoded_key)
+        let encoded_key = urlencoding::encode(key).replace("%2F", "/");
+        let endpoint = self.config.endpoint.trim_end_matches('/');
+        
+        // 将 bucket 作为子域名插入到 endpoint 中
+        if let Some(pos) = endpoint.find("://") {
+            let protocol = &endpoint[..pos + 3];
+            let domain = &endpoint[pos + 3..];
+            format!("{}{}.{}/{}", protocol, self.config.bucket, domain, encoded_key)
+        } else {
+            // 如果没有协议前缀，直接使用 bucket 作为前缀
+            format!("{}.{}/{}", self.config.bucket, endpoint, encoded_key)
+        }
     }
 }
 
