@@ -5,9 +5,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use anyhow::{Result, Context};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Semaphore};
+use md5;
 
 /// 分块大小 10MB
 const BATCH_SIZE: usize = 10 * 1024 * 1024;
@@ -89,6 +90,10 @@ impl OssClient {
 
     /// 单文件上传
     async fn upload_single(&self, path: &Path, key: &str) -> Result<String> {
+        // 计算文件MD5
+        let file_md5 = self.calculate_file_md5(path).await?;
+        println!("文件MD5: {}", file_md5);
+
         let mut file = File::open(path).await?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer).await?;
@@ -103,6 +108,9 @@ impl OssClient {
             .send()
             .await?;
 
+        // 验证上传后的文件MD5
+        self.verify_uploaded_file_md5(key, &file_md5).await?;
+
         Ok(self.generate_url(key))
     }
 
@@ -113,6 +121,10 @@ impl OssClient {
         let total_parts = ((file_size + BATCH_SIZE as u64 - 1) / BATCH_SIZE as u64) as usize;
 
         println!("分块上传 {} 到 {}", path.display(), key);
+
+        // 计算文件MD5
+        let file_md5 = self.calculate_file_md5(path).await?;
+        println!("文件MD5: {}", file_md5);
 
         // 创建分块上传
         let create_resp = self.client
@@ -142,44 +154,24 @@ impl OssClient {
         let pb = Arc::new(pb);
         let semaphore = Arc::new(Semaphore::new(MAX_WORKERS));
 
-        // 读取文件所有数据
-        let mut file = File::open(path).await?;
-        let mut parts_data = Vec::with_capacity(total_parts);
+        // 并发上传分块
+        let mut tasks = Vec::with_capacity(total_parts);
         
         for part_num in 1..=total_parts {
-            let mut buffer = vec![0u8; BATCH_SIZE];
-            let bytes_read = file.read(&mut buffer).await?;
-            if bytes_read == 0 {
-                break;
-            }
-            buffer.truncate(bytes_read);
-            parts_data.push((part_num, buffer));
-        }
-
-        // 并发上传分块
-        let mut tasks = Vec::with_capacity(parts_data.len());
-        let parts_data = Arc::new(Mutex::new(parts_data));
-
-        for _ in 0..parts_data.lock().await.len() {
             let client = self.client.clone();
             let bucket = self.config.bucket.clone();
             let key = key.to_string();
             let upload_id = upload_id.clone();
-            let parts_data = parts_data.clone();
             let pb = pb.clone();
             let semaphore = semaphore.clone();
-
+            let path = path.to_path_buf();
+            
             let task = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await?;
                 
-                let (part_number, data) = {
-                    let mut parts = parts_data.lock().await;
-                    if parts.is_empty() {
-                        return Ok::<Option<CompletedPart>, anyhow::Error>(None);
-                    }
-                    parts.remove(0)
-                };
-
+                // 读取指定部分的数据
+                let (part_number, data) = Self::read_file_part(&path, part_num).await?;
+                
                 let body = aws_sdk_s3::primitives::ByteStream::from(data.clone());
 
                 let resp = client
@@ -194,26 +186,61 @@ impl OssClient {
 
                 pb.inc(data.len() as u64);
 
-                Ok(Some(
+                Ok::<CompletedPart, anyhow::Error>(
                     CompletedPart::builder()
                         .part_number(part_number as i32)
                         .e_tag(resp.e_tag().unwrap_or_default())
                         .build()
-                ))
+                )
             });
-
+            
             tasks.push(task);
         }
 
         // 收集结果
         let mut completed_parts = Vec::new();
         for task in tasks {
-            if let Some(part) = task.await?? {
-                completed_parts.push(part);
+            match task.await {
+                Ok(Ok(part)) => completed_parts.push(part),
+                Ok(Err(e)) => {
+                    // 发生错误，取消上传
+                    let _ = self.client
+                        .abort_multipart_upload()
+                        .bucket(&self.config.bucket)
+                        .key(key)
+                        .upload_id(&upload_id)
+                        .send()
+                        .await;
+                    return Err(e);
+                }
+                Err(e) => {
+                    // 任务执行错误，取消上传
+                    let _ = self.client
+                        .abort_multipart_upload()
+                        .bucket(&self.config.bucket)
+                        .key(&*key)
+                        .upload_id(&upload_id)
+                        .send()
+                        .await;
+                    return Err(anyhow::Error::new(e));
+                }
             }
         }
 
         pb.finish_with_message("上传完成");
+
+        // 验证所有分块都已成功上传
+        if completed_parts.len() != total_parts {
+            // 取消上传
+            let _ = self.client
+                .abort_multipart_upload()
+                .bucket(&self.config.bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(anyhow::anyhow!("上传失败：部分分块未成功上传"));
+        }
 
         // 按 PartNumber 排序
         completed_parts.sort_by_key(|p| p.part_number());
@@ -232,7 +259,73 @@ impl OssClient {
             .send()
             .await?;
 
+        // 验证上传后的文件MD5
+        self.verify_uploaded_file_md5(key, &file_md5).await?;
+
         Ok(self.generate_url(key))
+    }
+
+    /// 计算文件的MD5值
+    async fn calculate_file_md5(&self, path: &Path) -> Result<String> {
+        let mut file = File::open(path).await?;
+        let mut hasher = md5::Context::new();
+        let mut buffer = [0u8; 8192];
+        
+        loop {
+            let bytes_read = file.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.consume(&buffer[..bytes_read]);
+        }
+        
+        Ok(format!("{:x}", hasher.compute()))
+    }
+
+    /// 读取文件的指定部分
+    async fn read_file_part(path: &Path, part_number: usize) -> Result<(usize, Vec<u8>)> {
+        let mut file = File::open(path).await?;
+        let offset = (part_number - 1) * BATCH_SIZE;
+
+        file.seek(std::io::SeekFrom::Start(offset as u64)).await?;
+
+        // 使用 take 限制最多读取 BATCH_SIZE 字节，并使用 read_to_end 确保读取完整
+        let mut limited_file = file.take(BATCH_SIZE as u64);
+        let mut buffer = Vec::with_capacity(BATCH_SIZE);
+        limited_file.read_to_end(&mut buffer).await?;
+
+        Ok((part_number, buffer))
+    }
+
+    /// 验证上传文件的MD5
+    async fn verify_uploaded_file_md5(&self, key: &str, expected_md5: &str) -> Result<()> {
+        // 下载文件并计算MD5
+        let resp = self.client
+            .get_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .send()
+            .await?;
+        
+        let mut stream = resp.body;
+        let mut hasher = md5::Context::new();
+        
+        while let Some(chunk) = stream.try_next().await? {
+            hasher.consume(&chunk);
+        }
+        
+        let uploaded_md5 = format!("{:x}", hasher.compute());
+        
+        if uploaded_md5 != expected_md5 {
+            return Err(anyhow::anyhow!(
+                "MD5校验失败：预期 {}，实际 {}",
+                expected_md5,
+                uploaded_md5
+            ));
+        }
+        
+        println!("MD5校验成功：{}", uploaded_md5);
+        Ok(())
     }
 
     /// 下载文件
